@@ -1,0 +1,159 @@
+pipeline {
+    agent any
+
+    environment {
+        DOCKER_CRED = 'dockerhub-id'
+        GIT_CRED = 'github-id'
+        SONAR_TOKEN_ID = 'SONAR_TOKEN'
+        NOTIFY_EMAIL = 'jayapriya054@gmail.com'
+        IMAGE_NAME = "jayapriya054/frontend:${BUILD_NUMBER}"
+        SONAR_HOST_URL = "http://localhost:9000"
+    }
+
+    options {
+        timeout(time: 2, unit: 'HOURS')
+        timestamps()
+    }
+
+    stages {
+
+        stage('Checkout') {
+            steps {
+                git branch: 'main',
+                    url: 'https://github.com/jayapriya054/Jenkins-project.git',
+                    credentialsId: "${GIT_CRED}"
+            }
+        }
+
+        stage('Unit Tests') {
+            steps {
+                sh '''
+                    docker run --rm -v $(pwd):/app -w /app python:3.11 \
+                    sh -c "pip install -r requirements.txt && pip install pytest && pytest -v"
+                '''
+            }
+        }
+
+        stage('Dependency Vulnerability Check') {
+            steps {
+                sh '''
+                    docker run --rm -v $(pwd):/app -w /app python:3.11 \
+                    sh -c "pip install safety && safety check -r requirements.txt || true"
+                '''
+            }
+        }
+
+        stage('Code Review - SonarQube') {
+            environment {
+                SONAR_TOKEN = credentials("${SONAR_TOKEN_ID}")
+            }
+            steps {
+                withSonarQubeEnv('SonarQube') {
+                    sh '''
+                        docker run --rm -v $(pwd):/app -w /app sonarsource/sonar-scanner-cli \
+                        -Dsonar.projectKey=python-ci-cd-pipeline \
+                        -Dsonar.sources=. \
+                        -Dsonar.host.url=$SONAR_HOST_URL \
+                        -Dsonar.login=$SONAR_TOKEN
+                    '''
+                }
+            }
+        }
+
+        stage('Build Docker Image') {
+            steps {
+                sh "docker build -t ${IMAGE_NAME} ."
+            }
+        }
+
+        stage('Trivy Image Scan') {
+            steps {
+                sh '''
+                    docker run --rm -v /var/run/docker.sock:/var/run/docker.sock \
+                    aquasec/trivy image ${IMAGE_NAME} || true
+                '''
+            }
+        }
+
+        stage('Push Docker Image') {
+            steps {
+                withCredentials([usernamePassword(
+                    credentialsId: "${DOCKER_CRED}",
+                    usernameVariable: 'USER',
+                    passwordVariable: 'PASS'
+                )]) {
+                    sh '''
+                        echo $PASS | docker login -u $USER --password-stdin
+                        docker push ${IMAGE_NAME}
+                    '''
+                }
+            }
+        }
+
+        stage('Deploy Preview') {
+            steps {
+                script {
+                    def ns = "preview-${BUILD_NUMBER}"
+                    env.PREVIEW_NS = ns
+
+                    sh """
+                        kubectl create namespace ${ns} || true
+                        kubectl -n ${ns} run app --image=${IMAGE_NAME} --port=5000
+                        kubectl -n ${ns} expose pod app --type=NodePort --port=5000
+                    """
+
+                    env.PREVIEW_URL = "http://localhost:$(kubectl -n ${ns} get svc app -o jsonpath='{.spec.ports[0].nodePort}')"
+                }
+            }
+        }
+
+        stage('Schedule Cleanup') {
+            steps {
+                script {
+                    def ns = env.PREVIEW_NS
+                    sh """
+                        (sleep 1800 && kubectl delete namespace ${ns}) &
+                    """
+                }
+            }
+        }
+
+        stage('Generate Consolidated Report') {
+            steps {
+                script {
+                    def report = """
+CI/CD Report
+
+Preview URL: ${env.PREVIEW_URL}
+Sonar Project: ${SONAR_HOST_URL}/dashboard?id=python-ci-cd-pipeline
+
+Docker Image: ${IMAGE_NAME}
+
+Build Number: ${BUILD_NUMBER}
+"""
+
+                    writeFile file: 'report.txt', text: report
+                    archiveArtifacts artifacts: 'report.txt'
+                }
+            }
+        }
+    }
+
+    post {
+        success {
+            emailext(
+                subject: "CI/CD SUCCESS - Build ${BUILD_NUMBER}",
+                body: readFile('report.txt'),
+                to: "${NOTIFY_EMAIL}"
+            )
+        }
+
+        failure {
+            emailext(
+                subject: "CI/CD FAILURE - Build ${BUILD_NUMBER}",
+                body: "Pipeline failed. Check: ${BUILD_URL}",
+                to: "${NOTIFY_EMAIL}"
+            )
+        }
+    }
+}
